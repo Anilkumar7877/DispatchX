@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RedAlert - Real-Time Ambulance Dispatch Dashboard</title>
+    <!-- Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        }
+        body {
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            background: #0f172a;
+            color: #f8fafc;
+        }
+        header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px 24px;
+            background: #1e293b;
+            border-bottom: 1px solid #334155;
+            z-index: 1000;
+        }
+        .logo-group {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .logo-icon {
+            font-size: 24px;
+        }
+        h1 {
+            font-size: 20px;
+            font-weight: 700;
+            color: #ef4444;
+            letter-spacing: -0.5px;
+        }
+        .subtitle {
+            font-size: 13px;
+            color: #94a3b8;
+            margin-left: 8px;
+        }
+        .header-stats {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            border-radius: 9999px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        .badge-free {
+            background: rgba(16, 185, 129, 0.2);
+            color: #10b981;
+            border: 1px solid #10b981;
+        }
+        .badge-busy {
+            background: rgba(239, 68, 68, 0.2);
+            color: #ef4444;
+            border: 1px solid #ef4444;
+        }
+        .badge-ws {
+            background: rgba(59, 130, 246, 0.2);
+            color: #60a5fa;
+            border: 1px solid #3b82f6;
+        }
+        .badge-ws.connected {
+            background: rgba(16, 185, 129, 0.2);
+            color: #34d399;
+            border-color: #10b981;
+        }
+        .badge-ws.disconnected {
+            background: rgba(239, 68, 68, 0.2);
+            color: #f87171;
+            border-color: #ef4444;
+        }
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: currentColor;
+        }
+        main {
+            display: flex;
+            flex: 1;
+            overflow: hidden;
+        }
+        #map {
+            flex: 1;
+            height: 100%;
+            background: #1e293b;
+        }
+        aside {
+            width: 360px;
+            background: #1e293b;
+            border-left: 1px solid #334155;
+            display: flex;
+            flex-direction: column;
+            z-index: 999;
+        }
+        .aside-header {
+            padding: 16px;
+            border-bottom: 1px solid #334155;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .aside-header h2 {
+            font-size: 15px;
+            font-weight: 600;
+            color: #f1f5f9;
+        }
+        .incident-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .incident-card {
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            padding: 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            transition: all 0.2s ease;
+        }
+        .incident-card:hover {
+            border-color: #64748b;
+        }
+        .incident-card.popped {
+            opacity: 0.7;
+            border-style: dashed;
+        }
+        .incident-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .incident-type {
+            font-size: 14px;
+            font-weight: 600;
+            color: #f8fafc;
+        }
+        .severity-badge {
+            font-size: 11px;
+            font-weight: 700;
+            padding: 2px 6px;
+            border-radius: 4px;
+        }
+        .severity-high {
+            background: #ef4444;
+            color: #fff;
+        }
+        .severity-med {
+            background: #f59e0b;
+            color: #fff;
+        }
+        .severity-low {
+            background: #10b981;
+            color: #fff;
+        }
+        .incident-meta {
+            font-size: 12px;
+            color: #94a3b8;
+            display: flex;
+            justify-content: space-between;
+        }
+        .empty-placeholder {
+            text-align: center;
+            color: #64748b;
+            padding: 40px 16px;
+            font-size: 13px;
+        }
+        /* Custom Leaflet popup dark style */
+        .leaflet-popup-content-wrapper {
+            background: #1e293b;
+            color: #f8fafc;
+            border: 1px solid #475569;
+            border-radius: 8px;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.5);
+        }
+        .leaflet-popup-tip {
+            background: #1e293b;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="logo-group">
+            <span class="logo-icon">🚑</span>
+            <div>
+                <h1>RedAlert</h1>
+            </div>
+            <span class="subtitle">Bengaluru Real-Time Dispatch Dashboard</span>
+        </div>
+        <div class="header-stats">
+            <div id="ws-status" class="badge badge-ws disconnected">
+                <span class="status-dot"></span>
+                <span id="ws-status-text">Connecting WebSocket...</span>
+            </div>
+            <div class="badge badge-free">
+                <span class="status-dot"></span>
+                <span id="count-free">0 Free</span>
+            </div>
+            <div class="badge badge-busy">
+                <span class="status-dot"></span>
+                <span id="count-busy">0 Busy</span>
+            </div>
+        </div>
+    </header>
+
+    <main>
+        <div id="map"></div>
+        <aside>
+            <div class="aside-header">
+                <h2>Emergency Incidents</h2>
+                <span id="incident-count" style="font-size: 12px; color: #94a3b8;">0 Total</span>
+            </div>
+            <div id="incident-list" class="incident-list">
+                <div class="empty-placeholder">No emergency incidents reported yet.<br>Listening on incident:updates...</div>
+            </div>
+        </aside>
+    </main>
+
+    <!-- Leaflet JS -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+    <script>
+        // 1. Initialize Map centered on Bengaluru
+        const map = L.map('map').setView([12.97, 77.59], 12);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 19,
+            attribution: '© OpenStreetMap contributors'
+        }).addTo(map);
+
+        // Track live unit markers & incident markers by ID
+        const unitMarkers = {};
+        const incidentMarkers = {};
+        const unitStatuses = {};
+        const incidents = [];
+
+        function updateCounts() {
+            let free = 0;
+            let busy = 0;
+            for (const id in unitStatuses) {
+                if (unitStatuses[id] === 'free') free++;
+                else if (unitStatuses[id] === 'busy' || unitStatuses[id] === 'dispatched') busy++;
+            }
+            document.getElementById('count-free').textContent = `${free} Free`;
+            document.getElementById('count-busy').textContent = `${busy} Busy`;
+        }
+
+        // Color mapping
+        function getMarkerColor(status) {
+            if (status === 'free') return '#10b981'; // Green
+            return '#ef4444'; // Red for busy / dispatched
+        }
+
+        // 2. Handle Unit Update message from WebSocket
+        function handleUnitUpdate(data) {
+            const unitId = data.unit_id;
+            const status = data.status || 'free';
+            const lat = parseFloat(data.lat);
+            const lon = parseFloat(data.lon);
+
+            // If unit went offline (from keyspace expiry), remove its marker
+            if (status === 'offline' || isNaN(lat) || isNaN(lon)) {
+                if (unitMarkers[unitId]) {
+                    map.removeLayer(unitMarkers[unitId]);
+                    delete unitMarkers[unitId];
+                }
+                delete unitStatuses[unitId];
+                updateCounts();
+                return;
+            }
+
+            unitStatuses[unitId] = status;
+            const color = getMarkerColor(status);
+
+            if (unitMarkers[unitId]) {
+                // Smoothly update location
+                unitMarkers[unitId].setLatLng([lat, lon]);
+                unitMarkers[unitId].setStyle({
+                    fillColor: color,
+                    color: '#ffffff'
+                });
+                unitMarkers[unitId].setPopupContent(`
+                    <div style="font-size: 13px;">
+                        <strong>Ambulance:</strong> ${unitId}<br>
+                        <strong>Status:</strong> <span style="color:${color}; font-weight:bold;">${status.toUpperCase()}</span><br>
+                        <strong>Coordinates:</strong> ${lat.toFixed(4)}, ${lon.toFixed(4)}
+                    </div>
+                `);
+            } else {
+                // Create new circle marker
+                const marker = L.circleMarker([lat, lon], {
+                    radius: 8,
+                    fillColor: color,
+                    color: '#ffffff',
+                    weight: 2,
+                    opacity: 1,
+                    fillOpacity: 0.9
+                }).addTo(map);
+
+                marker.bindPopup(`
+                    <div style="font-size: 13px;">
+                        <strong>Ambulance:</strong> ${unitId}<br>
+                        <strong>Status:</strong> <span style="color:${color}; font-weight:bold;">${status.toUpperCase()}</span><br>
+                        <strong>Coordinates:</strong> ${lat.toFixed(4)}, ${lon.toFixed(4)}
+                    </div>
+                `);
+
+                unitMarkers[unitId] = marker;
+            }
+
+            updateCounts();
+        }
+
+        // 3. Handle Incident Update message from WebSocket
+        function handleIncidentUpdate(data) {
+            incidents.unshift(data);
+            if (incidents.length > 20) incidents.pop();
+
+            const listEl = document.getElementById('incident-list');
+            listEl.innerHTML = '';
+
+            incidents.forEach(inc => {
+                const card = document.createElement('div');
+                const isPopped = inc.event === 'popped';
+                card.className = `incident-card ${isPopped ? 'popped' : ''}`;
+
+                const sev = parseInt(inc.severity) || 1;
+                let sevClass = 'severity-low';
+                if (sev >= 7) sevClass = 'severity-high';
+                else if (sev >= 4) sevClass = 'severity-med';
+
+                card.innerHTML = `
+                    <div class="incident-card-header">
+                        <span class="incident-type">${inc.type || 'Emergency'}</span>
+                        <span class="severity-badge ${sevClass}">Sev ${sev}</span>
+                    </div>
+                    <div class="incident-meta">
+                        <span>${isPopped ? '⚡ Dispatched' : '🚨 New Alert'}</span>
+                        <span>ID: #${inc.incident_id || inc.id || 'N/A'}</span>
+                    </div>
+                `;
+                listEl.appendChild(card);
+            });
+
+            document.getElementById('incident-count').textContent = `${incidents.length} Recent`;
+
+            // Plot incident marker if valid coordinates present
+            if (data.lat && data.lon && data.event !== 'popped') {
+                const lat = parseFloat(data.lat);
+                const lon = parseFloat(data.lon);
+                if (!isNaN(lat) && !isNaN(lon)) {
+                    const incMarker = L.circleMarker([lat, lon], {
+                        radius: 11,
+                        fillColor: '#f59e0b',
+                        color: '#ffffff',
+                        weight: 3,
+                        dashArray: '3, 3',
+                        fillOpacity: 0.85
+                    }).addTo(map);
+
+                    incMarker.bindPopup(`
+                        <div style="font-size: 13px;">
+                            <strong style="color:#ef4444;">🚨 Incident #${data.id || data.incident_id}</strong><br>
+                            <strong>Type:</strong> ${data.type}<br>
+                            <strong>Severity:</strong> ${data.severity}/10
+                        </div>
+                    `).openPopup();
+                }
+            }
+        }
+
+        // 4. WebSocket connection to /ws with auto-reconnect
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws`;
+
+            const wsBadge = document.getElementById('ws-status');
+            const wsText = document.getElementById('ws-status-text');
+
+            const socket = new WebSocket(wsUrl);
+
+            socket.onopen = () => {
+                wsBadge.className = 'badge badge-ws connected';
+                wsText.textContent = 'Live Pub/Sub Connected';
+            };
+
+            socket.onmessage = (event) => {
+                try {
+                    const payload = JSON.parse(event.data);
+                    if (payload.channel === 'incident:updates' || payload.event) {
+                        handleIncidentUpdate(payload);
+                    } else if (payload.channel === 'unit:updates' || payload.unit_id) {
+                        handleUnitUpdate(payload);
+                    }
+                } catch (e) {
+                    console.error("Failed to parse WebSocket JSON payload:", e, event.data);
+                }
+            };
+
+            socket.onclose = () => {
+                wsBadge.className = 'badge badge-ws disconnected';
+                wsText.textContent = 'Disconnected (Retrying...)';
+                setTimeout(connectWebSocket, 2000);
+            };
+
+            socket.onerror = (err) => {
+                socket.close();
+            };
+        }
+
+        // Start WebSocket listener
+        connectWebSocket();
+    </script>
+</body>
+</html>
+

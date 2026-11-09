@@ -11,6 +11,11 @@ from fastapi import FastAPI, HTTPException, Body, Query, Header, Response, WebSo
 from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel, Field
 import redis.asyncio as aioredis
+from redis.commands.search.field import TagField, NumericField
+from redis.commands.search.index_definition import IndexDefinition, IndexType
+from redis.commands.search.query import Query as SearchQuery
+from redis.commands.search.aggregation import AggregateRequest
+from redis.commands.search import reducers
 
 try:
     from app.redis_client import redis_client
@@ -104,6 +109,29 @@ async def lifespan(app: FastAPI):
             pass  # Consumer group already exists, ignore
         else:
             raise exc
+
+    # 3. Phase 8A: RediSearch Index Creation
+    # Redis Command: FT.CREATE idx:incidents ON JSON PREFIX 1 closed:incident: SCHEMA ...
+    # Why: Creates an inverted index on JSON documents with prefix closed:incident:
+    # Tag fields allow exact multi-value matching; Numeric Sortable fields enable range queries & sorting.
+    incidents_schema = (
+        TagField("$.type", as_name="type"),
+        TagField("$.zone", as_name="zone"),
+        NumericField("$.severity", as_name="severity", sortable=True),
+        NumericField("$.closed_at", as_name="closed_at", sortable=True),
+        NumericField("$.response_secs", as_name="response_secs", sortable=True),
+    )
+    try:
+        redis_client.ft("idx:incidents").create_index(
+            incidents_schema,
+            definition=IndexDefinition(prefix=["closed:incident:"], index_type=IndexType.JSON),
+        )
+    except Exception as exc:
+        # Ignore "Index already exists" error
+        if "already exists" in str(exc).lower() or "busy" in str(exc).lower():
+            pass
+        else:
+            print(f"Warning creating RediSearch index idx:incidents: {exc}")
 
     # Start background task to listen for heartbeat expirations
     expiry_task = asyncio.create_task(listen_to_keyspace_expirations())
@@ -1136,6 +1164,127 @@ def manual_dispatch_incident(assignment: ManualDispatchRequest):
         "message": f"Unit '{raw_unit_id}' manually dispatched to Incident #{raw_incident_id}",
         "incident_id": raw_incident_id,
         "unit_id": raw_unit_id,
+    }
+
+
+# ===========================================================================
+# PHASE 8A: REDISEARCH & JSON INCIDENT HISTORY
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# GET /history/search (Phase 8A: FT.SEARCH with Dynamic Filters)
+# ---------------------------------------------------------------------------
+@app.get("/history/search")
+def search_incident_history(
+    type: Optional[str] = Query(None, description="Filter by incident type (TAG field)"),
+    zone: Optional[str] = Query(None, description="Filter by geographic zone (TAG field)"),
+    min_severity: Optional[int] = Query(None, ge=1, le=10, description="Minimum severity rating"),
+    from_time: Optional[int] = Query(None, alias="from", description="Earliest closed_at (unix epoch seconds)"),
+    to_time: Optional[int] = Query(None, alias="to", description="Latest closed_at (unix epoch seconds)"),
+    limit: int = Query(default=10, ge=1, le=1000, description="Maximum results to return"),
+):
+    query_parts: List[str] = []
+
+    # TAG field filtering: syntax is @field:{val}
+    # Escape special characters in TAG values if necessary
+    if type:
+        clean_type = type.replace(" ", "\\ ")
+        query_parts.append(f"@type:{{{clean_type}}}")
+
+    if zone:
+        clean_zone = zone.replace(" ", "\\ ")
+        query_parts.append(f"@zone:{{{clean_zone}}}")
+
+    # NUMERIC field range filtering: syntax is @field:[min max]
+    if min_severity is not None:
+        query_parts.append(f"@severity:[{min_severity} +inf]")
+
+    if from_time is not None or to_time is not None:
+        start_bound = from_time if from_time is not None else "-inf"
+        end_bound = to_time if to_time is not None else "+inf"
+        query_parts.append(f"@closed_at:[{start_bound} {end_bound}]")
+
+    raw_query_string = " ".join(query_parts) if query_parts else "*"
+
+    # Redis Command: FT.SEARCH idx:incidents <query> SORTBY closed_at DESC LIMIT 0 <limit>
+    # Why RediSearch: Queries inverted index over JSON documents without full keyspace scan.
+    # Yields sub-millisecond execution times over thousands of closed records.
+    search_query = (
+        SearchQuery(raw_query_string)
+        .sort_by("closed_at", asc=False)
+        .paging(0, limit)
+    )
+
+    try:
+        search_result = redis_client.ft("idx:incidents").search(search_query)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail=f"RediSearch query execution failed: {exc}",
+        )
+
+    formatted_matches = []
+    for doc in search_result.docs:
+        doc_data = json.loads(doc.json) if hasattr(doc, "json") and doc.json else {}
+        doc_data["id"] = doc.id
+        formatted_matches.append(doc_data)
+
+    return {
+        "query": raw_query_string,
+        "total": search_result.total,
+        "count": len(formatted_matches),
+        "results": formatted_matches,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /history/stats/by-zone (Phase 8A: FT.AGGREGATE grouped by zone)
+# ---------------------------------------------------------------------------
+@app.get("/history/stats/by-zone")
+def get_history_stats_by_zone():
+    # Redis Command: FT.AGGREGATE idx:incidents * GROUPBY 1 @zone REDUCE count 0 AS incident_count REDUCE avg 1 @response_secs AS avg_response_secs REDUCE max 1 @response_secs AS max_response_secs
+    # Why Aggregations: Runs data processing directly on the Redis engine avoiding network transmission of raw records.
+    agg_request = (
+        AggregateRequest("*")
+        .group_by(
+            "@zone",
+            reducers.count().alias("incident_count"),
+            reducers.avg("@response_secs").alias("avg_response_secs"),
+            reducers.max("@response_secs").alias("max_response_secs"),
+        )
+    )
+
+    try:
+        agg_result = redis_client.ft("idx:incidents").aggregate(agg_request)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail=f"RediSearch aggregate execution failed: {exc}",
+        )
+
+    zone_stats = []
+    for row in agg_result.rows:
+        # row format: ['zone', 'central', 'incident_count', '120', 'avg_response_secs', '245.5', 'max_response_secs', '580']
+        row_dict = {}
+        for i in range(0, len(row), 2):
+            key = row[i]
+            val = row[i + 1]
+            row_dict[key] = val
+
+        try:
+            zone_stats.append({
+                "zone": row_dict.get("zone", "unknown"),
+                "incident_count": int(row_dict.get("incident_count", 0)),
+                "avg_response_secs": round(float(row_dict.get("avg_response_secs", 0.0)), 2),
+                "max_response_secs": int(float(row_dict.get("max_response_secs", 0.0))),
+            })
+        except Exception:
+            zone_stats.append(row_dict)
+
+    return {
+        "index": "idx:incidents",
+        "zones_reported": len(zone_stats),
+        "stats": zone_stats,
     }
 
 

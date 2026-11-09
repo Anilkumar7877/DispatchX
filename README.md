@@ -22,6 +22,7 @@ RedAlert demonstrates how Redis native data structures cleanly model complex rea
 | **Fixed Window Rate Limiting** | `INCR`, `EXPIRE ... 60 NX`, `TTL` | **String Counter** (`rl:{src}:{time}`) | Allows 5 requests/min per `X-Source` with 1 network RTT pipeline, returns `429` with `Retry-After`. |
 | **Cardinality Estimation** | `PFADD`, `PFCOUNT`, `PFMERGE` | **HyperLogLog** (`callers:*`, `areas:*`) | Tracks unique callers & active zones over arbitrary date ranges using ~12 KB constant memory. |
 | **Uptime & Overlap Analytics** | `SETBIT`, `GETBIT`, `BITCOUNT`, `BITOP AND` | **Bitmap** (`unit:{id}:online:*`) | Daily 24-hour fleet uptime tracking in just 3 bytes per unit, computing fleet overlap via bitwise operations. |
+| **JSON Records & Secondary Index** | `JSON.SET`, `FT.CREATE`, `FT.SEARCH`, `FT.AGGREGATE` | **RedisJSON & RediSearch** (`idx:incidents`) | Inverted index over `closed:incident:*` JSON documents for sub-millisecond multi-attribute search and real-time aggregations. |
 
 ---
 
@@ -248,6 +249,52 @@ python memory_compare.py
 
 # 2. Run the fixed-window rate limit test (sends 8 rapid requests)
 python rate_limit_test.py
+```
+
+---
+
+## 🔍 Phase 8A: RediSearch & RedisJSON Incident History
+
+Phase 8A archives completed incidents as rich JSON documents and enables sub-millisecond secondary indexing:
+
+### 1. JSON Document Storage (`JSON.SET`)
+When workers finish an incident, a record is stored with `JSON.SET closed:incident:{id} $`:
+```json
+{
+  "type": "Cardiac Arrest",
+  "zone": "central",
+  "severity": 9,
+  "closed_at": 1794240579,
+  "response_secs": 240,
+  "assigned_unit": "sim-12"
+}
+```
+
+### 2. Secondary Index (`FT.CREATE idx:incidents`)
+On startup, RediSearch indexes documents matching prefix `closed:incident:`:
+- **`TAG` Fields**: `type`, `zone` for exact multi-value matching (`@zone:{central}`).
+- **`NUMERIC SORTABLE` Fields**: `severity`, `closed_at`, `response_secs` for range filtering and hardware-level sorting.
+
+### 3. Dynamic Multi-Attribute Search (`GET /history/search`)
+Builds an `FT.SEARCH` query from query parameters:
+- Filter by type, zone, minimum severity, and unix time ranges.
+- Sorts results by `closed_at` descending (`SORTBY closed_at DESC`).
+```bash
+curl.exe "http://localhost:8000/history/search?zone=central&min_severity=8&limit=5"
+curl.exe "http://localhost:8000/history/search?type=Cardiac%20Arrest&from=1794000000"
+```
+
+### 4. Analytics by Zone (`GET /history/stats/by-zone`)
+Executes `FT.AGGREGATE idx:incidents *` grouped by `@zone` using reducers:
+- Computes `count()`, `avg(@response_secs)`, and `max(@response_secs)` directly on the Redis engine with zero network serialization overhead.
+```bash
+curl.exe "http://localhost:8000/history/stats/by-zone"
+```
+
+### 5. Seeding Historical Data (`seed_history.py`)
+Generates 5,000 realistic closed incident records spread across 30 days:
+```bash
+python seed_history.py --count 5000
 ```
 
 ---

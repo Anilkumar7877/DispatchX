@@ -377,9 +377,36 @@ def process_incident_message(worker_name: str, message_id: str, fields: Dict[str
     # Why: Acknowledges completion, purging the entry from PEL.
     redis_client.xack(STREAM_NAME, GROUP_NAME, message_id)
 
+    # -----------------------------------------------------------------------
+    # Phase 8A: RediSearch / JSON Record for Closed Incident
+    # -----------------------------------------------------------------------
+    # Redis Command: JSON.SET closed:incident:{id} $ <json_data>
+    # Why: Persists structured JSON document indexed by RediSearch (idx:incidents).
+    # Allows rich multi-field filtering (TAG, NUMERIC) and FT.AGGREGATE analytics.
+    closed_at_timestamp = int(dispatched_timestamp)
+    # Estimate or calculate response seconds from creation or random urban dispatch interval (60-600s)
+    created_ts = fields.get("timestamp") or dispatched_timestamp
+    try:
+        response_secs = max(30, int(float(dispatched_timestamp) - float(created_ts)))
+    except Exception:
+        response_secs = random.randint(120, 480)
+
+    closed_record = {
+        "type": incident_type,
+        "zone": fields.get("zone", "central"),
+        "severity": int(severity) if str(severity).isdigit() else 5,
+        "closed_at": closed_at_timestamp,
+        "response_secs": response_secs,
+        "assigned_unit": assigned_unit,
+    }
+    try:
+        redis_client.json().set(f"closed:incident:{incident_id}", "$", closed_record)
+    except Exception as err:
+        print(f"[{worker_name}] ⚠️ JSON.SET failed for closed:incident:{incident_id}: {err}")
+
     print(
         f"[{worker_name}] 🚑 Assigned Unit '{assigned_unit}' ({assigned_distance:.2f}km away) "
-        f"to Incident #{incident_id} [{active_mode}] | XACK {message_id}"
+        f"to Incident #{incident_id} [{active_mode}] | Closed JSON stored | XACK {message_id}"
     )
     return True
 

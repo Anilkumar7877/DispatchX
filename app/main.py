@@ -45,8 +45,6 @@ def handle_unit_expired(unit_id: str):
 
     # Redis Command: PUBLISH unit:updates <json>
     # Why: Broadcast the offline event so connected WebSockets/dashboards remove the marker in real time.
-    # Note on Fire-and-Forget: Pub/Sub delivers messages only to currently connected subscribers;
-    # if a client is disconnected at the time of publish, it will not receive the notification later.
     offline_msg = {
         "unit_id": unit_id,
         "lat": None,
@@ -89,9 +87,21 @@ async def listen_to_keyspace_expirations():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup:
-    # Redis Command: CONFIG SET notify-keyspace-events Ex
+    # 1. Redis Command: CONFIG SET notify-keyspace-events Ex
     # Why: Enables keyspace notifications specifically for expired events ('x') on keyspace ('E').
     redis_client.config_set("notify-keyspace-events", "Ex")
+
+    # 2. Redis Command: XGROUP CREATE incidents:stream dispatchers $ MKSTREAM
+    # Why: Creates a named consumer group ('dispatchers') on 'incidents:stream' for worker distribution.
+    # id='$' means consumers will receive only new messages written after group creation.
+    # mkstream=True automatically creates the stream if it does not already exist.
+    try:
+        redis_client.xgroup_create("incidents:stream", "dispatchers", id="$", mkstream=True)
+    except Exception as exc:
+        if "BUSYGROUP" in str(exc):
+            pass  # Consumer group already exists, ignore
+        else:
+            raise exc
 
     # Start background task to listen for heartbeat expirations
     expiry_task = asyncio.create_task(listen_to_keyspace_expirations())
@@ -108,8 +118,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="RedAlert",
-    description="Real-time ambulance dispatch system - Phases 1, 2, 3, & 4",
-    version="4.0.0",
+    description="Real-time ambulance dispatch system - Phases 1 to 5",
+    version="5.0.0",
     lifespan=lifespan,
 )
 
@@ -137,12 +147,16 @@ class IncidentCreateRequest(BaseModel):
     severity: int = Field(..., ge=1, le=10, description="Severity rating from 1 (minor) to 10 (critical)")
 
 
+class ManualDispatchRequest(BaseModel):
+    incident_id: str = Field(..., description="ID of the emergency incident to assign")
+    unit_id: str = Field(..., description="ID of the ambulance unit to dispatch")
+
+
 # ---------------------------------------------------------------------------
-# 3. GET /dashboard - Serves Dashboard HTML
+# GET /dashboard - Serves Leaflet Dashboard HTML
 # ---------------------------------------------------------------------------
 @app.get("/dashboard", response_class=HTMLResponse)
 def get_dashboard():
-    # Attempt to locate dashboard.html in app root or workspace root
     paths = [
         os.path.join(os.path.dirname(__file__), "..", "dashboard.html"),
         os.path.join(os.path.dirname(__file__), "dashboard.html"),
@@ -160,7 +174,7 @@ def get_root():
     return {
         "service": "RedAlert",
         "description": "Real-time Ambulance Dispatch System",
-        "phase": 4,
+        "phases_implemented": [1, 2, 3, 4, 5],
         "dashboard_url": "/dashboard",
         "websocket_url": "/ws",
     }
@@ -310,7 +324,6 @@ def update_unit_status(unit_id: str, payload: UnitStatusUpdateRequest):
 
     # Redis Command: PUBLISH unit:updates <json>
     # Why Pub/Sub: Notifies real-time WebSockets of the unit's new status.
-    # Note on Fire-and-Forget: Pub/Sub does not persist messages; subscribers must be connected to receive.
     status_update_event = {
         "unit_id": unit_id,
         "lat": unit_lat,
@@ -368,7 +381,7 @@ def get_unit_online_status(unit_id: str):
 # ===========================================================================
 
 # ---------------------------------------------------------------------------
-# 1. POST /units/{id}/location (GEOADD and PUBLISH unit:updates)
+# POST /units/{id}/location (GEOADD and PUBLISH unit:updates)
 # ---------------------------------------------------------------------------
 @app.post("/units/{unit_id}/location")
 def update_unit_location(
@@ -397,7 +410,6 @@ def update_unit_location(
 
     # Redis Command: PUBLISH unit:updates <json>
     # Why Pub/Sub: Real-time broadcast of unit location to the WebSocket dashboard.
-    # Note on Fire-and-Forget: If no WebSocket is connected at this instant, the message is dropped.
     location_update_event = {
         "unit_id": unit_id,
         "lat": latitude,
@@ -434,7 +446,7 @@ def delete_unit_location(unit_id: str):
 
 
 # ===========================================================================
-# PHASE 3 & PHASE 4: ZONES, AVAILABILITY, & INCIDENTS (WITH PUBLISHING)
+# PHASE 3: ZONES, AVAILABILITY, & INCIDENTS
 # ===========================================================================
 
 # ---------------------------------------------------------------------------
@@ -522,6 +534,7 @@ def create_incident(incident: IncidentCreateRequest):
             "lat": str(incident.lat),
             "lon": str(incident.lon),
             "severity": str(incident.severity),
+            "status": "pending",
         },
     )
 
@@ -529,9 +542,20 @@ def create_incident(incident: IncidentCreateRequest):
     # Why Sorted Set: Forms a priority queue ordered by severity score.
     redis_client.zadd("incidents:queue", {incident_key: incident.severity})
 
+    # Redis Command: XADD incidents:stream * <fields...>
+    # Why Stream: Streams provide durable, persistent message logging with consumer groups and acknowledgments (XACK).
+    # Unlike Pub/Sub which is fire-and-forget, Streams keep messages safe in memory and disk until acknowledged.
+    stream_fields = {
+        "incident_id": str(incident_id),
+        "type": incident.type,
+        "lat": str(incident.lat),
+        "lon": str(incident.lon),
+        "severity": str(incident.severity),
+    }
+    redis_client.xadd("incidents:stream", stream_fields)
+
     # Redis Command: PUBLISH incident:updates <json>
     # Why Pub/Sub: Real-time notification of newly created emergency incidents.
-    # Note on Fire-and-Forget: Pub/Sub does not persist messages; subscribers must be connected to receive.
     incident_created_event = {
         "event": "created",
         "id": str(incident_id),
@@ -540,6 +564,7 @@ def create_incident(incident: IncidentCreateRequest):
         "lat": incident.lat,
         "lon": incident.lon,
         "severity": incident.severity,
+        "status": "pending",
         "timestamp": time.time(),
     }
     redis_client.publish("incident:updates", json.dumps(incident_created_event))
@@ -551,6 +576,7 @@ def create_incident(incident: IncidentCreateRequest):
         "lat": incident.lat,
         "lon": incident.lon,
         "severity": incident.severity,
+        "status": "pending",
     }
 
 
@@ -619,6 +645,357 @@ def get_incidents_queue():
     ]
 
 
+# ---------------------------------------------------------------------------
+# 5. GET /stream/stats (Phase 5: XLEN, XPENDING, XINFO CONSUMERS)
+# ---------------------------------------------------------------------------
+@app.get("/stream/stats")
+def get_stream_stats():
+    # Redis Command: XLEN incidents:stream
+    # Why: Returns the total number of entries in the stream.
+    try:
+        stream_length = redis_client.xlen("incidents:stream")
+    except Exception:
+        stream_length = 0
+
+    # Redis Command: XPENDING incidents:stream dispatchers
+    # Why: Returns the Pending Entries List (PEL) summary showing unacknowledged messages.
+    try:
+        pending_summary = redis_client.xpending("incidents:stream", "dispatchers")
+    except Exception:
+        pending_summary = {"pending": 0, "min": None, "max": None, "consumers": []}
+
+    # Redis Command: XINFO CONSUMERS incidents:stream dispatchers
+    # Why: Retrieves state for all registered consumers in the group (pending counts, idle times).
+    try:
+        consumers_info = redis_client.xinfo_consumers("incidents:stream", "dispatchers")
+    except Exception:
+        consumers_info = []
+
+    return {
+        "stream": "incidents:stream",
+        "group": "dispatchers",
+        "length": stream_length,
+        "pending": pending_summary,
+        "consumers": consumers_info,
+    }
+
+
+# ===========================================================================
+# PHASE 5: AUTOMATED DISPATCH ENGINE & MISSION LIFECYCLE
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# POST /dispatch/auto - Auto-assigns closest free unit to highest priority incident
+# ---------------------------------------------------------------------------
+@app.post("/dispatch/auto")
+def auto_dispatch_incident(
+    radius_km: float = Query(default=10.0, description="Search radius around the emergency in km")
+):
+    # 1. Pop highest severity incident from priority queue
+    # Redis Command: ZPOPMAX incidents:queue 1
+    popped = redis_client.zpopmax("incidents:queue", count=1)
+    if not popped:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail="No pending incidents in queue to dispatch",
+        )
+
+    incident_key, score = popped[0]
+    incident_data = redis_client.hgetall(incident_key)
+
+    if not incident_data or "lat" not in incident_data or "lon" not in incident_data:
+        raise HTTPException(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Corrupt or missing incident data for '{incident_key}'",
+        )
+
+    incident_lat = float(incident_data["lat"])
+    incident_lon = float(incident_data["lon"])
+    incident_id = incident_data.get("id") or incident_key.split(":")[-1]
+
+    # 2. Find closest ambulances via Geospatial search
+    # Redis Command: GEOSEARCH units:geo FROMLONLAT <lon> <lat> BYRADIUS <radius> km ASC WITHDIST
+    nearby_units = redis_client.geosearch(
+        "units:geo",
+        longitude=incident_lon,
+        latitude=incident_lat,
+        radius=radius_km,
+        unit="km",
+        sort="ASC",
+        withdist=True,
+    )
+
+    selected_unit_id: Optional[str] = None
+    selected_distance: float = 0.0
+
+    # 3. Locate closest available unit that is currently free and online
+    for member, distance in nearby_units:
+        raw_id = member.split("unit:", 1)[1] if member.startswith("unit:") else member
+
+        # Redis Commands: SISMEMBER units:free {id} & EXISTS hb:unit:{id}
+        # Why: Confirms the ambulance is both marked 'free' and actively sending heartbeats
+        is_free = redis_client.sismember("units:free", raw_id) == 1
+        is_online = redis_client.exists(f"hb:unit:{raw_id}") == 1
+
+        if is_free and is_online:
+            selected_unit_id = raw_id
+            selected_distance = float(distance)
+            break
+
+    # If no online free ambulance found within radius:
+    if not selected_unit_id:
+        # Re-queue the incident so it is not lost!
+        # Redis Command: ZADD incidents:queue <score> incident:{id}
+        redis_client.zadd("incidents:queue", {incident_key: score})
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail=f"No online free ambulances within {radius_km} km of Incident #{incident_id}. Incident has been returned to queue.",
+        )
+
+    # 4. Perform atomic dispatch assignment
+    unit_key = f"unit:{selected_unit_id}"
+    dispatched_timestamp = time.time()
+
+    # Move unit availability: units:free -> units:busy
+    # Redis Command: SMOVE units:free units:busy {id}
+    redis_client.smove("units:free", "units:busy", selected_unit_id)
+
+    # Update unit status and link active mission
+    # Redis Command: HSET unit:{id} status dispatched current_incident incident:{id}
+    redis_client.hset(
+        unit_key,
+        mapping={
+            "status": "dispatched",
+            "current_incident": incident_key,
+        },
+    )
+
+    # Update incident status and link assigned ambulance
+    # Redis Command: HSET incident:{id} status dispatched assigned_unit unit:{id} dispatched_at <ts>
+    redis_client.hset(
+        incident_key,
+        mapping={
+            "status": "dispatched",
+            "assigned_unit": selected_unit_id,
+            "dispatched_at": str(dispatched_timestamp),
+        },
+    )
+
+    # Fetch vehicle telemetry for broadcast
+    pos = redis_client.geopos("units:geo", f"unit:{selected_unit_id}")
+    unit_lon, unit_lat = pos[0] if (pos and pos[0] is not None) else (None, None)
+    unit_driver = redis_client.hget(unit_key, "driver") or "Unknown"
+    unit_type = redis_client.hget(unit_key, "type") or "ALS"
+
+    # 5. Broadcast dispatch events across WebSockets
+    # Redis Command: PUBLISH unit:updates & PUBLISH incident:updates
+    redis_client.publish(
+        "unit:updates",
+        json.dumps({
+            "unit_id": selected_unit_id,
+            "lat": unit_lat,
+            "lon": unit_lon,
+            "status": "dispatched",
+            "current_incident": incident_key,
+            "timestamp": dispatched_timestamp,
+        }),
+    )
+    redis_client.publish(
+        "incident:updates",
+        json.dumps({
+            "event": "dispatched",
+            "id": str(incident_id),
+            "incident_id": str(incident_id),
+            "type": incident_data.get("type", "Emergency"),
+            "assigned_unit": selected_unit_id,
+            "distance_km": round(selected_distance, 3),
+            "timestamp": dispatched_timestamp,
+        }),
+    )
+
+    # Estimate city ETA (assuming average urban speed of 35 km/h)
+    estimated_eta_min = round((selected_distance / 35.0) * 60.0, 1)
+
+    return {
+        "status": "dispatched",
+        "message": f"Ambulance '{selected_unit_id}' successfully dispatched to Incident #{incident_id}",
+        "incident": {
+            "id": str(incident_id),
+            "type": incident_data.get("type"),
+            "severity": int(score) if isinstance(score, (int, float)) else score,
+            "coordinates": {"lat": incident_lat, "lon": incident_lon},
+        },
+        "assigned_unit": {
+            "id": selected_unit_id,
+            "driver": unit_driver,
+            "type": unit_type,
+            "distance_km": round(selected_distance, 3),
+            "estimated_eta_minutes": max(1.0, estimated_eta_min),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /dispatch/manual - Manually assign specific unit to an incident
+# ---------------------------------------------------------------------------
+@app.post("/dispatch/manual")
+def manual_dispatch_incident(assignment: ManualDispatchRequest):
+    incident_key = f"incident:{assignment.incident_id}" if not assignment.incident_id.startswith("incident:") else assignment.incident_id
+    unit_key = f"unit:{assignment.unit_id}" if not assignment.unit_id.startswith("unit:") else assignment.unit_id
+    raw_unit_id = assignment.unit_id.split("unit:", 1)[1] if assignment.unit_id.startswith("unit:") else assignment.unit_id
+    raw_incident_id = assignment.incident_id.split("incident:", 1)[1] if assignment.incident_id.startswith("incident:") else assignment.incident_id
+
+    if not redis_client.exists(incident_key):
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Incident '{assignment.incident_id}' not found")
+
+    if not redis_client.exists(unit_key):
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Unit '{assignment.unit_id}' not found")
+
+    if not redis_client.sismember("units:free", raw_unit_id):
+        raise HTTPException(status_code=http_status.HTTP_409_CONFLICT, detail=f"Unit '{assignment.unit_id}' is not free")
+
+    # Remove incident from queue if present
+    # Redis Command: ZREM incidents:queue incident:{id}
+    redis_client.zrem("incidents:queue", incident_key)
+
+    # Atomically move unit:free -> units:busy
+    # Redis Command: SMOVE units:free units:busy {id}
+    redis_client.smove("units:free", "units:busy", raw_unit_id)
+
+    dispatched_timestamp = time.time()
+    redis_client.hset(unit_key, mapping={"status": "dispatched", "current_incident": incident_key})
+    redis_client.hset(incident_key, mapping={"status": "dispatched", "assigned_unit": raw_unit_id, "dispatched_at": str(dispatched_timestamp)})
+
+    pos = redis_client.geopos("units:geo", f"unit:{raw_unit_id}")
+    unit_lon, unit_lat = pos[0] if (pos and pos[0] is not None) else (None, None)
+
+    redis_client.publish("unit:updates", json.dumps({
+        "unit_id": raw_unit_id,
+        "lat": unit_lat,
+        "lon": unit_lon,
+        "status": "dispatched",
+        "current_incident": incident_key,
+        "timestamp": dispatched_timestamp,
+    }))
+    redis_client.publish("incident:updates", json.dumps({
+        "event": "dispatched",
+        "id": raw_incident_id,
+        "incident_id": raw_incident_id,
+        "assigned_unit": raw_unit_id,
+        "timestamp": dispatched_timestamp,
+    }))
+
+    return {
+        "status": "dispatched",
+        "message": f"Unit '{raw_unit_id}' manually dispatched to Incident #{raw_incident_id}",
+        "incident_id": raw_incident_id,
+        "unit_id": raw_unit_id,
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /dispatch/{incident_id}/resolve - Complete mission & release ambulance
+# ---------------------------------------------------------------------------
+@app.post("/dispatch/{incident_id}/resolve")
+def resolve_incident(incident_id: str):
+    incident_key = f"incident:{incident_id}" if not incident_id.startswith("incident:") else incident_id
+    raw_incident_id = incident_id.split("incident:", 1)[1] if incident_id.startswith("incident:") else incident_id
+
+    if not redis_client.exists(incident_key):
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=f"Incident '{incident_id}' not found",
+        )
+
+    assigned_unit_id = redis_client.hget(incident_key, "assigned_unit")
+    resolved_timestamp = time.time()
+
+    # Redis Command: HSET incident:{id} status resolved
+    redis_client.hset(
+        incident_key,
+        mapping={
+            "status": "resolved",
+            "resolved_at": str(resolved_timestamp),
+        },
+    )
+
+    # Release the assigned ambulance back to free status
+    if assigned_unit_id:
+        unit_key = f"unit:{assigned_unit_id}"
+        # Redis Command: HDEL unit:{id} current_incident
+        redis_client.hdel(unit_key, "current_incident")
+        # Redis Command: HSET unit:{id} status free
+        redis_client.hset(unit_key, "status", "free")
+        # Redis Command: SMOVE units:busy units:free {id}
+        redis_client.smove("units:busy", "units:free", assigned_unit_id)
+
+        pos = redis_client.geopos("units:geo", f"unit:{assigned_unit_id}")
+        unit_lon, unit_lat = pos[0] if (pos and pos[0] is not None) else (None, None)
+
+        redis_client.publish(
+            "unit:updates",
+            json.dumps({
+                "unit_id": assigned_unit_id,
+                "lat": unit_lat,
+                "lon": unit_lon,
+                "status": "free",
+                "timestamp": resolved_timestamp,
+            }),
+        )
+
+    # Publish incident resolution event
+    redis_client.publish(
+        "incident:updates",
+        json.dumps({
+            "event": "resolved",
+            "id": raw_incident_id,
+            "incident_id": raw_incident_id,
+            "released_unit": assigned_unit_id,
+            "timestamp": resolved_timestamp,
+        }),
+    )
+
+    return {
+        "status": "resolved",
+        "message": f"Incident #{raw_incident_id} successfully marked as resolved",
+        "released_unit": assigned_unit_id,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /dispatch/active - List all currently active dispatches
+# ---------------------------------------------------------------------------
+@app.get("/dispatch/active")
+def get_active_dispatches():
+    # Redis Command: SMEMBERS units:busy
+    busy_units = redis_client.smembers("units:busy")
+    active_missions = []
+
+    for unit_id in busy_units:
+        unit_key = f"unit:{unit_id}"
+        current_inc_key = redis_client.hget(unit_key, "current_incident")
+
+        if current_inc_key:
+            inc_data = redis_client.hgetall(current_inc_key)
+            driver = redis_client.hget(unit_key, "driver")
+            vehicle_type = redis_client.hget(unit_key, "type")
+            pos = redis_client.geopos("units:geo", f"unit:{unit_id}")
+            unit_lon, unit_lat = pos[0] if (pos and pos[0] is not None) else (None, None)
+
+            active_missions.append({
+                "unit": {
+                    "id": unit_id,
+                    "driver": driver,
+                    "type": vehicle_type,
+                    "location": {"lat": unit_lat, "lon": unit_lon},
+                },
+                "incident": inc_data,
+                "dispatched_at": inc_data.get("dispatched_at"),
+            })
+
+    return active_missions
+
+
 # ===========================================================================
 # 2. WEBSOCKET ENDPOINT (/ws)
 # ===========================================================================
@@ -632,8 +1009,6 @@ async def websocket_endpoint(websocket: WebSocket):
 
     # Redis Command: SUBSCRIBE unit:updates incident:updates
     # Why Pub/Sub: Low-latency streaming of telemetry & dispatch events to WebSocket clients.
-    # Note on Fire-and-Forget: Pub/Sub does not hold a buffer. Disconnected clients miss messages
-    # published while offline; they receive only live messages published after subscribing.
     await pubsub.subscribe("unit:updates", "incident:updates")
 
     async def forward_pubsub_messages():
@@ -651,8 +1026,8 @@ async def websocket_endpoint(websocket: WebSocket):
                         payload["channel"] = channel
 
                     await websocket.send_json(payload)
-        except Exception as e:
-            print("Error in forward_pubsub_messages:", e)
+        except Exception:
+            pass
 
     forward_task = asyncio.create_task(forward_pubsub_messages())
 

@@ -1,11 +1,13 @@
+from datetime import datetime, timezone, timedelta
 import asyncio
 from contextlib import asynccontextmanager
 import json
 import os
 import time
 from typing import Optional, List, Dict, Any
+import uuid
 
-from fastapi import FastAPI, HTTPException, Body, Query, WebSocket, WebSocketDisconnect, status as http_status
+from fastapi import FastAPI, HTTPException, Body, Query, Header, Response, WebSocket, WebSocketDisconnect, status as http_status
 from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel, Field
 import redis.asyncio as aioredis
@@ -145,6 +147,7 @@ class IncidentCreateRequest(BaseModel):
     lat: float = Field(..., description="Latitude of the incident")
     lon: float = Field(..., description="Longitude of the incident")
     severity: int = Field(..., ge=1, le=10, description="Severity rating from 1 (minor) to 10 (critical)")
+    zone: Optional[str] = Field(default="central", description="Geographic zone of the incident (default: 'central')")
 
 
 class ManualDispatchRequest(BaseModel):
@@ -340,7 +343,7 @@ def update_unit_status(unit_id: str, payload: UnitStatusUpdateRequest):
 
 
 # ---------------------------------------------------------------------------
-# POST /units/{id}/heartbeat
+# POST /units/{id}/heartbeat (Phases 1 & 7: Ephemeral TTL + Daily Uptime Bitmaps)
 # ---------------------------------------------------------------------------
 @app.post("/units/{unit_id}/heartbeat")
 def send_heartbeat(unit_id: str):
@@ -350,11 +353,57 @@ def send_heartbeat(unit_id: str):
     # Why: Sets ephemeral key with 10-second TTL to maintain online liveness.
     redis_client.set(heartbeat_key, 1, ex=10)
 
+    # -----------------------------------------------------------------------
+    # Phase 7: Uptime Bitmap Tracking
+    # -----------------------------------------------------------------------
+    # Redis Command: SETBIT unit:{id}:online:{YYYY-MM-DD} <hour> 1
+    # Why Bitmaps: Storing 24 hours of uptime in a Redis string bitmap requires only
+    # 3 bytes (24 bits) per unit per day, instead of hundreds of bytes in sets or lists.
+    # Trade-off: Bitmaps offer massive memory savings for binary flags, but cannot store
+    # granular metadata (like sub-hour timestamps or duration) per bit.
+    now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+    current_hour = now.hour
+    bitmap_key = f"unit:{unit_id}:online:{today_str}"
+    redis_client.setbit(bitmap_key, current_hour, 1)
+
     return {
         "unit_id": unit_id,
         "status": "ok",
         "message": "Heartbeat registered",
         "ttl": 10,
+        "hour_recorded": current_hour,
+        "date": today_str,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /units/{id}/uptime (Phase 7: BITCOUNT & Bit Inspection)
+# ---------------------------------------------------------------------------
+@app.get("/units/{unit_id}/uptime")
+def get_unit_uptime(
+    unit_id: str,
+    date: str = Query(..., description="Date formatted as YYYY-MM-DD"),
+):
+    bitmap_key = f"unit:{unit_id}:online:{date}"
+
+    # Redis Command: BITCOUNT unit:{id}:online:{YYYY-MM-DD}
+    # Why: In-memory hardware-level population count (POPCNT) returning total bits set to 1.
+    hours_online = redis_client.bitcount(bitmap_key)
+
+    # Redis Command: GETBIT unit:{id}:online:{YYYY-MM-DD} <offset>
+    # Why: Reads individual bits 0..23 representing each hour of the day.
+    active_hours: List[int] = []
+    for h in range(24):
+        bit_val = redis_client.getbit(bitmap_key, h)
+        if bit_val == 1:
+            active_hours.append(h)
+
+    return {
+        "unit_id": unit_id,
+        "date": date,
+        "hours_online": hours_online,
+        "active_hours": active_hours,
     }
 
 
@@ -515,10 +564,70 @@ def list_units_in_zone(zone: str):
 
 
 # ---------------------------------------------------------------------------
-# POST /incidents (Phase 3 & 4: ZADD and PUBLISH incident:updates)
+# POST /incidents (Phases 3, 4, 5 & 7: Rate Limiting, HLL, Stream, Pub/Sub)
 # ---------------------------------------------------------------------------
 @app.post("/incidents", status_code=http_status.HTTP_201_CREATED)
-def create_incident(incident: IncidentCreateRequest):
+def create_incident(
+    incident: IncidentCreateRequest,
+    response: Response,
+    x_source: Optional[str] = Header(None, alias="X-Source", description="Unique identifier for incident source (e.g. phone number or client ID)"),
+):
+    if not x_source:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail="Header 'X-Source' is required to report an incident",
+        )
+
+    # -----------------------------------------------------------------------
+    # Phase 7: Fixed Window Rate Limiter
+    # -----------------------------------------------------------------------
+    # Redis Commands: INCR rl:{source}:{minute} + EXPIRE ... 60 NX in a pipeline
+    # Why Pipeline: Bundles INCR and conditional EXPIRE into 1 network round-trip.
+    # Fixed Window Trade-off: Fixed window limiters are computationally minimal (O(1) counter),
+    # but suffer from the boundary burst weakness: up to 2x the limit can be admitted
+    # across a minute boundary (e.g., 5 at 00:59 and 5 at 01:00).
+    now_dt = datetime.now()
+    window_minute = now_dt.strftime("%Y-%m-%dT%H:%M")
+    rate_limit_key = f"rl:{x_source}:{window_minute}"
+
+    pipe = redis_client.pipeline(transaction=False)
+    pipe.incr(rate_limit_key)
+    pipe.expire(rate_limit_key, 60, nx=True)
+    pipe_results = pipe.execute()
+    current_request_count = pipe_results[0]
+
+    if current_request_count > 5:
+        # Exceeded limit: return 429 with Retry-After header equal to key TTL
+        ttl_remaining = redis_client.ttl(rate_limit_key)
+        retry_after_sec = max(1, ttl_remaining if ttl_remaining > 0 else 60)
+        return Response(
+            content=json.dumps({
+                "detail": "Rate limit exceeded. Maximum 5 requests per minute allowed.",
+                "source": x_source,
+                "current_count": current_request_count,
+                "retry_after": retry_after_sec,
+            }),
+            status_code=http_status.HTTP_429_TOO_MANY_REQUESTS,
+            media_type="application/json",
+            headers={"Retry-After": str(retry_after_sec)},
+        )
+
+    # -----------------------------------------------------------------------
+    # Phase 7: HyperLogLog Cardinality Tracking
+    # -----------------------------------------------------------------------
+    # Redis Commands: PFADD callers:{YYYY-MM-DD} <source> & PFADD areas:{YYYY-MM-DD} <zone>
+    # Why HyperLogLog: Probabilistic cardinality estimation using a constant ~12 KB memory
+    # per key regardless of cardinality (whether 10 callers or 100 million).
+    # Trade-off: Provides a fast approximation with a standard error of ~0.81%, but cannot
+    # recall individual member identities.
+    today_date = now_dt.strftime("%Y-%m-%d")
+    incident_zone = incident.zone or "central"
+    redis_client.pfadd(f"callers:{today_date}", x_source)
+    redis_client.pfadd(f"areas:{today_date}", incident_zone)
+
+    # -----------------------------------------------------------------------
+    # Incident Persistence (Phases 3, 4, 5)
+    # -----------------------------------------------------------------------
     # Redis Command: INCR incident:id
     # Why: Atomic auto-incrementing ID generator.
     incident_id = redis_client.incr("incident:id")
@@ -534,6 +643,8 @@ def create_incident(incident: IncidentCreateRequest):
             "lat": str(incident.lat),
             "lon": str(incident.lon),
             "severity": str(incident.severity),
+            "zone": incident_zone,
+            "source": x_source,
             "status": "pending",
         },
     )
@@ -551,6 +662,8 @@ def create_incident(incident: IncidentCreateRequest):
         "lat": str(incident.lat),
         "lon": str(incident.lon),
         "severity": str(incident.severity),
+        "zone": incident_zone,
+        "source": x_source,
     }
     redis_client.xadd("incidents:stream", stream_fields)
 
@@ -564,6 +677,8 @@ def create_incident(incident: IncidentCreateRequest):
         "lat": incident.lat,
         "lon": incident.lon,
         "severity": incident.severity,
+        "zone": incident_zone,
+        "source": x_source,
         "status": "pending",
         "timestamp": time.time(),
     }
@@ -576,6 +691,8 @@ def create_incident(incident: IncidentCreateRequest):
         "lat": incident.lat,
         "lon": incident.lon,
         "severity": incident.severity,
+        "zone": incident_zone,
+        "source": x_source,
         "status": "pending",
     }
 
@@ -643,6 +760,135 @@ def get_incidents_queue():
         }
         for member, score in queue_entries
     ]
+
+
+# ===========================================================================
+# PHASE 7: STATS & ANALYTICS (HYPERLOGLOG & BITMAP OVERLAP)
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# GET /stats/daily (Phase 7: PFCOUNT for callers & areas)
+# ---------------------------------------------------------------------------
+@app.get("/stats/daily")
+def get_daily_stats(date: str = Query(..., description="Date formatted as YYYY-MM-DD")):
+    callers_key = f"callers:{date}"
+    areas_key = f"areas:{date}"
+
+    # Redis Command: PFCOUNT callers:{YYYY-MM-DD}
+    # Why: Retrieves estimated unique cardinality without needing to store all caller strings.
+    unique_callers = redis_client.pfcount(callers_key)
+
+    # Redis Command: PFCOUNT areas:{YYYY-MM-DD}
+    unique_areas = redis_client.pfcount(areas_key)
+
+    return {
+        "date": date,
+        "unique_callers": unique_callers,
+        "unique_areas": unique_areas,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /stats/range (Phase 7: PFMERGE multi-day union)
+# ---------------------------------------------------------------------------
+@app.get("/stats/range")
+def get_range_stats(
+    from_date: str = Query(..., alias="from", description="Start date (YYYY-MM-DD)"),
+    to_date: str = Query(..., alias="to", description="End date (YYYY-MM-DD)"),
+):
+    try:
+        start_dt = datetime.strptime(from_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(to_date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail="Dates must be in format YYYY-MM-DD",
+        )
+
+    if start_dt > end_dt:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail="'from' date must be before or equal to 'to' date",
+        )
+
+    # Generate day keys in range
+    day_keys: List[str] = []
+    curr = start_dt
+    while curr <= end_dt:
+        day_keys.append(f"callers:{curr.strftime('%Y-%m-%d')}")
+        curr += timedelta(days=1)
+
+    # Filter to existing keys
+    existing_keys = [k for k in day_keys if redis_client.exists(k)]
+
+    if not existing_keys:
+        return {
+            "from": from_date,
+            "to": to_date,
+            "days_checked": len(day_keys),
+            "unique_callers": 0,
+        }
+
+    # Redis Command: PFMERGE temp_key key1 key2 ...
+    # Why: In-memory union of multiple HyperLogLog registers into one key.
+    temp_key = f"temp:callers:range:{uuid.uuid4()}"
+    try:
+        redis_client.pfmerge(temp_key, *existing_keys)
+        unique_callers = redis_client.pfcount(temp_key)
+    finally:
+        # Clean up temporary key
+        redis_client.delete(temp_key)
+
+    return {
+        "from": from_date,
+        "to": to_date,
+        "days_checked": len(day_keys),
+        "days_found": len(existing_keys),
+        "unique_callers": unique_callers,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /stats/units-overlap (Phase 7: BITOP AND multi-unit uptime overlap)
+# ---------------------------------------------------------------------------
+@app.get("/stats/units-overlap")
+def get_units_overlap(
+    ids: str = Query(..., description="Comma-separated unit ids, e.g. '1,2,3' or 'sim-01,sim-02'"),
+    date: str = Query(..., description="Date formatted as YYYY-MM-DD"),
+):
+    unit_ids = [uid.strip() for uid in ids.split(",") if uid.strip()]
+    if not unit_ids:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail="At least one unit id must be provided in 'ids'",
+        )
+
+    bitmap_keys = [f"unit:{uid}:online:{date}" for uid in unit_ids]
+
+    # Temporary key for bitwise AND operation
+    temp_key = f"temp:overlap:{uuid.uuid4()}"
+    try:
+        # Redis Command: BITOP AND temp_key key1 key2 ...
+        # Why: Bitwise AND computes the intersection of 24-hour schedules in hardware-speed bit operations.
+        redis_client.bitop("AND", temp_key, *bitmap_keys)
+
+        # Redis Command: BITCOUNT temp_key
+        overlap_hours_count = redis_client.bitcount(temp_key)
+
+        # Inspect bits 0..23
+        overlap_hours: List[int] = []
+        for h in range(24):
+            if redis_client.getbit(temp_key, h) == 1:
+                overlap_hours.append(h)
+    finally:
+        redis_client.delete(temp_key)
+
+    return {
+        "date": date,
+        "unit_ids": unit_ids,
+        "overlap_hours_count": overlap_hours_count,
+        "overlap_hours": overlap_hours,
+    }
 
 
 # ---------------------------------------------------------------------------

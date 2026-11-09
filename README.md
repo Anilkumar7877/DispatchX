@@ -19,6 +19,9 @@ RedAlert demonstrates how Redis native data structures cleanly model complex rea
 | **Auto-Purge Offline** | `CONFIG SET`, `__keyevent@0__:expired` | **Keyspace Notifications** | Purges dead units from geospatial & availability sets on heartbeat expiry. |
 | **Durable Dispatch** | `XADD`, `XREADGROUP`, `XACK`, `XAUTOCLAIM` | **Stream** (`incidents:stream`) | Unlike Pub/Sub, Streams guarantee delivery: each message persists in a Pending Entries List (PEL) until `XACK`; dead-worker messages are reclaimed via `XAUTOCLAIM`. |
 | **Race-Free Assignment** | `SET NX PX`, `WATCH/MULTI/EXEC`, Lua | **Mutex / Lua Script** | Protects against concurrent double-assignments with switchable modes: `unsafe`, `lock`, `watch`, and `lua`. |
+| **Fixed Window Rate Limiting** | `INCR`, `EXPIRE ... 60 NX`, `TTL` | **String Counter** (`rl:{src}:{time}`) | Allows 5 requests/min per `X-Source` with 1 network RTT pipeline, returns `429` with `Retry-After`. |
+| **Cardinality Estimation** | `PFADD`, `PFCOUNT`, `PFMERGE` | **HyperLogLog** (`callers:*`, `areas:*`) | Tracks unique callers & active zones over arbitrary date ranges using ~12 KB constant memory. |
+| **Uptime & Overlap Analytics** | `SETBIT`, `GETBIT`, `BITCOUNT`, `BITOP AND` | **Bitmap** (`unit:{id}:online:*`) | Daily 24-hour fleet uptime tracking in just 3 bytes per unit, computing fleet overlap via bitwise operations. |
 
 ---
 
@@ -212,6 +215,39 @@ python race_test.py --mode unsafe
 python race_test.py --mode lock
 python race_test.py --mode watch
 python race_test.py --mode lua
+```
+
+---
+
+## 📊 Phase 7: Rate Limiting, HyperLogLog, & Fleet Bitmaps
+
+Phase 7 adds memory-efficient probabilistic data structures, bit-level fleet telemetry, and traffic defense:
+
+### 1. Fixed Window Rate Limiter
+- Protects `POST /incidents` requiring an `X-Source` header (e.g. caller phone number or client identifier).
+- Uses a batched `pipeline(transaction=False)` issuing `INCR rl:{source}:{YYYY-MM-DDTHH:MM}` and `EXPIRE ... 60 NX` in 1 network round-trip.
+- Limits traffic to 5 requests per minute per source. Over the limit, returns `HTTP 429 Too Many Requests` with a `Retry-After: <TTL>` header.
+- **Trade-off:** Fixed windows require minimal $O(1)$ integer operations, but suffer from the *boundary burst weakness*: up to 2x the limit can pass if requests straddle a minute boundary (e.g., 5 at 00:59 and 5 at 01:00).
+
+### 2. HyperLogLog Cardinality Tracking
+- Records unique emergency callers (`PFADD callers:{YYYY-MM-DD} <source>`) and incident zones (`PFADD areas:{YYYY-MM-DD} <zone>`) on every accepted incident.
+- `GET /stats/daily?date=YYYY-MM-DD` queries cardinality using `PFCOUNT`.
+- `GET /stats/range?from=YYYY-MM-DD&to=YYYY-MM-DD` merges multiple daily HLLs into a temporary key using `PFMERGE` to report multi-day unique callers, then immediately deletes the temporary key.
+- **Trade-off:** HyperLogLog uses a constant ~12 KB memory footprint regardless of cardinality (whether 10 callers or 100 million), with a standard theoretical error bound of ~0.81%, but cannot recall individual member identities.
+
+### 3. Fleet Uptime Bitmaps
+- Each heartbeat (`POST /units/{id}/heartbeat`) records the current hour (0–23) as an online bit: `SETBIT unit:{id}:online:{YYYY-MM-DD} <hour> 1`.
+- `GET /units/{id}/uptime?date=YYYY-MM-DD` returns total hours online using `BITCOUNT` alongside active hour offsets (`GETBIT`).
+- `GET /stats/units-overlap?ids=1,2,3&date=YYYY-MM-DD` performs `BITOP AND` across specified units into a temporary key to find common operational hours where all units were concurrently active.
+- **Trade-off:** Bitmaps store an entire day's hourly status in just 24 bits (3 bytes) per vehicle, but cannot store arbitrary metadata or sub-hourly timestamps.
+
+### 4. Running Phase 7 Test Scripts
+```bash
+# 1. Run the Set vs HyperLogLog memory and accuracy benchmark (100,000 items)
+python memory_compare.py
+
+# 2. Run the fixed-window rate limit test (sends 8 rapid requests)
+python rate_limit_test.py
 ```
 
 ---

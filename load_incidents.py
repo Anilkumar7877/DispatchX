@@ -50,13 +50,16 @@ def generate_incident(index: int):
     }
 
 
-def send_incident(api_url: str, payload: dict) -> dict:
+def send_incident(api_url: str, payload: dict, source: str = "load-tester") -> dict:
     url = f"{api_url.rstrip('/')}/incidents"
     data_bytes = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
         data=data_bytes,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "X-Source": source,
+        },
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=5.0) as resp:
@@ -79,9 +82,11 @@ def main():
 
     for i in range(1, args.count + 1):
         payload = generate_incident(i)
+        # Use rotating source IDs so bulk load testing is not blocked by single-source rate limit
+        source_id = f"caller-batch-{i % 10:02d}"
         try:
             start_req = time.perf_counter()
-            result = send_incident(args.url, payload)
+            result = send_incident(args.url, payload, source=source_id)
             elapsed_ms = (time.perf_counter() - start_req) * 1000.0
 
             incident_id = result.get("id") or result.get("incident_id")
